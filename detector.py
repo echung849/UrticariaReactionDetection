@@ -1,43 +1,132 @@
 import os
 import torch
-from PIL import Image
 import numpy as np
-from model import UrticariaDetectionModel
+from PIL import Image
 import torch.optim as optim
 import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset, random_split
+from sklearn.metrics import classification_report, confusion_matrix
+import matplotlib.pyplot as plt
+from model import UrticariaDetectionModel
 
 def organize_images(image_source):
+    """
+    Load and organize images from a directory into tensors.
+    
+    Args:
+        image_source (str): Path to directory containing images
+        
+    Returns:
+        torch.Tensor: Tensor containing all images
+        list: List of image filenames
+    """
     images = []
+    filenames = []
 
     for image in os.listdir(image_source):
         image_path = os.path.join(image_source, image)
-
-        # Load image and convert to tensor
-        image = Image.open(image_path)
-
-        # Convert PIL image to numpy array, normalize to [0,1], and convert to tensor
-        image_tensor = torch.FloatTensor(np.array(image)) / 255.0
-
-        # Add channel dimension if image is grayscale
-        if len(image_tensor.shape) == 2:
+        
+        try:
+            # Load image and convert to tensor
+            img = Image.open(image_path)
+            
+            # Convert PIL image to numpy array, normalize to [0,1], and convert to tensor
+            image_tensor = torch.FloatTensor(np.array(img)) / 255.0
+            
+            # Add channel dimension if image is grayscale
+            if len(image_tensor.shape) == 2:
+                image_tensor = image_tensor.unsqueeze(0)
+            
+            # Add batch dimension
             image_tensor = image_tensor.unsqueeze(0)
-
-        # Add batch dimension
-        image_tensor = image_tensor.unsqueeze(0)
-        images.append(image_tensor)
+            images.append(image_tensor)
+            filenames.append(image)
+        except Exception as e:
+            print(f"Error loading image {image}: {e}")
     
     # Stack all tensors along the batch dimension
-    return torch.cat(images, dim=0) #this basically returns a list of tensors
+    return torch.cat(images, dim=0), filenames
 
-def train_model(train_loader, val_loader, batch_size=10, epochs=100, learning_rate=0.001):
+def prepare_data(images, labels=None, train_ratio=0.7, val_ratio=0.15, batch_size=10):
+    """
+    Prepare data for training, validation, and testing.
+    
+    Args:
+        images (torch.Tensor): Tensor containing all images
+        labels (torch.Tensor, optional): Tensor containing labels (if available)
+        train_ratio (float): Ratio of data for training
+        val_ratio (float): Ratio of data for validation
+        batch_size (int): Batch size for data loaders
+        
+    Returns:
+        tuple: Train, validation and test data loaders
+    """
+    num_samples = images.size(0)
+    
+    if labels is None:
+        # If no labels provided, create dummy labels (for development purposes)
+        # In a real scenario, you'd need actual labels
+        labels = torch.randint(0, 2, (num_samples,))
+    
+    # Calculate split sizes
+    train_size = int(train_ratio * num_samples)
+    val_size = int(val_ratio * num_samples)
+    test_size = num_samples - train_size - val_size
+    
+    # Create full dataset
+    dataset = TensorDataset(images, labels)
+    
+    # Split dataset
+    train_dataset, val_dataset, test_dataset = random_split(
+        dataset, [train_size, val_size, test_size],
+        generator=torch.Generator().manual_seed(42)  # For reproducibility
+    )
+    
+    # Create data loaders
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size)
+    
+    return train_loader, val_loader, test_loader
+
+def train_model(train_loader, val_loader, device='cpu', batch_size=10, epochs=100, learning_rate=0.001):
+    """
+    Train the urticaria detection model.
+    
+    Args:
+        train_loader (DataLoader): Training data loader
+        val_loader (DataLoader): Validation data loader
+        device (str): Device to train on ('cpu' or 'cuda')
+        batch_size (int): Batch size for training
+        epochs (int): Number of training epochs
+        learning_rate (float): Learning rate for optimizer
+        
+    Returns:
+        tuple: Trained model and training metrics
+    """
+    # Check if GPU is available
+    device = torch.device(device if torch.cuda.is_available() and device == 'cuda' else 'cpu')
+    print(f"Training on device: {device}")
+    
+    # Get a sample batch to determine input size
+    for batch_X, _ in train_loader:
+        # Reshape the input to 2D for the model
+        # The model expects (batch_size, features) but we have (batch_size, channels, height, width)
+        batch_X = batch_X.view(batch_X.size(0), -1)  # Flatten all dimensions except batch
+        input_size = batch_X.size(1)
+        break
+        
     # Initialize model
-    model = UrticariaDetectionModel()
+    model = UrticariaDetectionModel(input_size=input_size)
+    model.to(device)
+    
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-5)
     
     # Learning rate scheduler
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=5, verbose=True
+    )
     
     # Training history
     train_losses = []
@@ -45,14 +134,24 @@ def train_model(train_loader, val_loader, batch_size=10, epochs=100, learning_ra
     train_accs = []
     val_accs = []
     
+    # Early stopping variables
+    best_val_loss = float('inf')
+    patience = 10
+    counter = 0
+    
     # Training loop
     for epoch in range(epochs):
+        # Training phase
         model.train()
         train_loss = 0
         train_correct = 0
         train_total = 0
         
         for batch_X, batch_y in train_loader:
+            # Reshape input to 2D before passing to model
+            batch_X = batch_X.view(batch_X.size(0), -1)  # Flatten all dimensions except batch
+            batch_X, batch_y = batch_X.to(device), batch_y.to(device)
+            
             optimizer.zero_grad()
             outputs = model(batch_X)
             loss = criterion(outputs, batch_y)
@@ -68,7 +167,7 @@ def train_model(train_loader, val_loader, batch_size=10, epochs=100, learning_ra
             train_total += batch_y.size(0)
             train_correct += (predicted == batch_y).sum().item()
         
-        # Validation
+        # Validation phase
         model.eval()
         val_loss = 0
         val_correct = 0
@@ -76,6 +175,10 @@ def train_model(train_loader, val_loader, batch_size=10, epochs=100, learning_ra
         
         with torch.no_grad():
             for batch_X, batch_y in val_loader:
+                # Reshape input to 2D before passing to model
+                batch_X = batch_X.view(batch_X.size(0), -1)  # Flatten all dimensions except batch
+                batch_X, batch_y = batch_X.to(device), batch_y.to(device)
+                
                 outputs = model(batch_X)
                 loss = criterion(outputs, batch_y)
                 val_loss += loss.item()
@@ -105,11 +208,46 @@ def train_model(train_loader, val_loader, batch_size=10, epochs=100, learning_ra
             print(f'Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%')
             print(f'Learning Rate: {optimizer.param_groups[0]["lr"]:.6f}')
             print('-' * 50)
+        
+        # Early stopping check
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            # Save the best model
+            torch.save(model.state_dict(), 'best_urticaria_model.pth')
+            counter = 0
+        else:
+            counter += 1
+            if counter >= patience:
+                print(f'Early stopping at epoch {epoch+1}')
+                break
     
-    return model, train_losses, val_losses, train_accs, val_accs
+    # Load the best model
+    model.load_state_dict(torch.load('best_urticaria_model.pth'))
+    
+    # Return the model and training history
+    return model, {
+        'train_losses': train_losses,
+        'val_losses': val_losses,
+        'train_accs': train_accs,
+        'val_accs': val_accs
+    }
 
-def test_model(model, test_loader):
+def test_model(model, test_loader, device='cpu'):
+    """
+    Test the trained model on test data.
+    
+    Args:
+        model (nn.Module): Trained model
+        test_loader (DataLoader): Test data loader
+        device (str): Device to test on ('cpu' or 'cuda')
+        
+    Returns:
+        tuple: Test metrics
+    """
+    device = torch.device(device if torch.cuda.is_available() and device == 'cuda' else 'cpu')
+    model.to(device)
     model.eval()
+    
     test_loss = 0
     test_correct = 0
     test_total = 0
@@ -118,10 +256,16 @@ def test_model(model, test_loader):
     # Lists to store predictions and ground truth for visualization
     all_predictions = []
     all_targets = []
+    all_probabilities = []
     
     with torch.no_grad():
         for batch_X, batch_y in test_loader:
+            # Reshape input to 2D before passing to model
+            batch_X = batch_X.view(batch_X.size(0), -1)  # Flatten all dimensions except batch
+            batch_X, batch_y = batch_X.to(device), batch_y.to(device)
+            
             outputs = model(batch_X)
+            probabilities = torch.softmax(outputs, dim=1)
             loss = criterion(outputs, batch_y)
             test_loss += loss.item()
             
@@ -132,6 +276,7 @@ def test_model(model, test_loader):
             # Store predictions and targets for visualization
             all_predictions.extend(predicted.cpu().numpy())
             all_targets.extend(batch_y.cpu().numpy())
+            all_probabilities.extend(probabilities.cpu().numpy())
     
     # Calculate final metrics
     test_loss = test_loss / len(test_loader)
@@ -141,39 +286,117 @@ def test_model(model, test_loader):
     print(f'Test Loss: {test_loss:.4f}')
     print(f'Test Accuracy: {test_acc:.2f}%')
     
-    return test_loss, test_acc
+    # Classification report and confusion matrix
+    try:
+        print('\nClassification Report:')
+        print(classification_report(all_targets, all_predictions, target_names=['Non-Urticaria', 'Urticaria']))
+        
+        cm = confusion_matrix(all_targets, all_predictions)
+        print('\nConfusion Matrix:')
+        print(cm)
+        
+        # Visualize confusion matrix
+        plt.figure(figsize=(8, 6))
+        plt.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
+        plt.title('Confusion Matrix')
+        plt.colorbar()
+        classes = ['Non-Urticaria', 'Urticaria']
+        tick_marks = np.arange(len(classes))
+        plt.xticks(tick_marks, classes, rotation=45)
+        plt.yticks(tick_marks, classes)
+        
+        # Add text annotations
+        thresh = cm.max() / 2.
+        for i in range(cm.shape[0]):
+            for j in range(cm.shape[1]):
+                plt.text(j, i, format(cm[i, j], 'd'),
+                        horizontalalignment="center",
+                        color="white" if cm[i, j] > thresh else "black")
+        
+        plt.tight_layout()
+        plt.ylabel('True label')
+        plt.xlabel('Predicted label')
+        plt.savefig('confusion_matrix.png')
+        print('Confusion matrix saved as confusion_matrix.png')
+    except Exception as e:
+        print(f"Error generating classification metrics: {e}")
+    
+    return {
+        'test_loss': test_loss,
+        'test_acc': test_acc,
+        'predictions': all_predictions,
+        'targets': all_targets,
+        'probabilities': all_probabilities
+    }
+
+def save_training_plots(history):
+    """
+    Generate and save training plots.
+    
+    Args:
+        history (dict): Training history dictionary
+    """
+    # Plot training & validation loss
+    plt.figure(figsize=(12, 5))
+    
+    plt.subplot(1, 2, 1)
+    plt.plot(history['train_losses'], label='Training Loss')
+    plt.plot(history['val_losses'], label='Validation Loss')
+    plt.title('Model Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    
+    plt.subplot(1, 2, 2)
+    plt.plot(history['train_accs'], label='Training Accuracy')
+    plt.plot(history['val_accs'], label='Validation Accuracy')
+    plt.title('Model Accuracy')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy (%)')
+    plt.legend()
+    
+    plt.tight_layout()
+    plt.savefig('training_history.png')
+    print('Training history plots saved as training_history.png')
 
 if __name__ == "__main__":
-    image_source = r"C:\Users\evely\VisualStudioCode_Files\UrticariaDetectionModel\train"
-    tensors = []
-
-    tensors = organize_images(image_source=image_source)
-
-    train_tensors = tensors[:116]
-    val_tensors = tensors[116:136]
-    test_tensors = tensors[136:]
-
-    # Create data loaders
-    train_dataset = TensorDataset(train_tensors) #i'm guessing TensorDataset() turns lists of tensors into a dataset format
-    train_loader = DataLoader(train_dataset, batch_size=10, shuffle=True) #this uses the dataset format created by TensorDataset() to create a DataLoader object?
-    val_dataset = TensorDataset(val_tensors)
-    val_loader = DataLoader(val_dataset, batch_size=10)
-    test_dataset = TensorDataset(test_tensors)
-    test_loader = DataLoader(test_dataset, batch_size=10)
-
+    # Path to your image data
+    image_source = os.path.join("train")
+    
+    # Check if CUDA is available
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    
+    # Load and organize images
+    images, filenames = organize_images(image_source)
+    
+    # For demonstration - need actual labels in real application
+    # Here we're creating random labels (0 or 1) for demonstration
+    # In a real scenario, you'd load actual labels
+    labels = torch.randint(0, 2, (images.size(0),))
+    
+    # Prepare data loaders
+    train_loader, val_loader, test_loader = prepare_data(
+        images, labels, train_ratio=0.7, val_ratio=0.15, batch_size=10
+    )
+    
     # Train the model
-    model, train_losses, val_losses, train_accs, val_accs = train_model(
+    print("Starting model training...")
+    model, history = train_model(
         train_loader, val_loader,
+        device=device,
         batch_size=10,
         epochs=100,
         learning_rate=0.001
     )
-
-    # Save the model
-    torch.save(model.state_dict(), 'urticaria_detection_model.pth')
+    
+    # Save training plots
+    save_training_plots(history)
     
     # Test the model
-    test_loss, test_acc = test_model(model, test_loader) 
-
-    #save model after test
-    torch.save(model.state_dict(), "final_urticariaDetectionModel.pth")
+    print("\nEvaluating model on test data...")
+    test_results = test_model(model, test_loader, device=device)
+    
+    # Save the final model
+    torch.save(model.state_dict(), "final_urticaria_detection_model.pth")
+    print("\nModel training and evaluation complete!")
+    print("Final model saved as 'final_urticaria_detection_model.pth'")
