@@ -9,12 +9,13 @@ from sklearn.metrics import classification_report, confusion_matrix
 import matplotlib.pyplot as plt
 from model import UrticariaDetectionModel
 
-def organize_images(image_source):
+def organize_images(image_source, target_size=(224, 224)):
     """
-    Load and organize images from a directory into tensors.
+    Load and organize images from a directory into tensors with consistent dimensions.
     
     Args:
         image_source (str): Path to directory containing images
+        target_size (tuple): Target size for all images (width, height)
         
     Returns:
         torch.Tensor: Tensor containing all images
@@ -23,19 +24,30 @@ def organize_images(image_source):
     images = []
     filenames = []
 
-    for image in os.listdir(image_source):
+    if not os.path.exists(image_source):
+        raise FileNotFoundError(f"Image directory not found: {image_source}")
+        
+    image_files = [f for f in os.listdir(image_source) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+    
+    if not image_files:
+        raise ValueError(f"No image files found in {image_source}")
+    
+    print(f"Found {len(image_files)} images in {image_source}")
+
+    for image in image_files:
         image_path = os.path.join(image_source, image)
         
         try:
-            # Load image and convert to tensor
-            img = Image.open(image_path)
+            # Load image and resize to target size
+            img = Image.open(image_path).convert('RGB')  # Convert to RGB to ensure 3 channels
+            img = img.resize(target_size)
             
             # Convert PIL image to numpy array, normalize to [0,1], and convert to tensor
-            image_tensor = torch.FloatTensor(np.array(img)) / 255.0
+            # Shape: (height, width, channels)
+            img_array = np.array(img) / 255.0
             
-            # Add channel dimension if image is grayscale
-            if len(image_tensor.shape) == 2:
-                image_tensor = image_tensor.unsqueeze(0)
+            # Convert to PyTorch tensor and rearrange to (channels, height, width) - PyTorch convention
+            image_tensor = torch.FloatTensor(img_array).permute(2, 0, 1)
             
             # Add batch dimension
             image_tensor = image_tensor.unsqueeze(0)
@@ -44,6 +56,9 @@ def organize_images(image_source):
         except Exception as e:
             print(f"Error loading image {image}: {e}")
     
+    if not images:
+        raise ValueError("No images were successfully loaded")
+        
     # Stack all tensors along the batch dimension
     return torch.cat(images, dim=0), filenames
 
@@ -65,13 +80,16 @@ def prepare_data(images, labels=None, train_ratio=0.7, val_ratio=0.15, batch_siz
     
     if labels is None:
         # If no labels provided, create dummy labels (for development purposes)
-        # In a real scenario, you'd need actual labels
+        print("WARNING: Using randomly generated labels for demonstration purposes.")
+        print("In a real application, you should provide actual labels.")
         labels = torch.randint(0, 2, (num_samples,))
     
     # Calculate split sizes
     train_size = int(train_ratio * num_samples)
     val_size = int(val_ratio * num_samples)
     test_size = num_samples - train_size - val_size
+    
+    print(f"Data split: {train_size} training, {val_size} validation, {test_size} test samples")
     
     # Create full dataset
     dataset = TensorDataset(images, labels)
@@ -110,13 +128,16 @@ def train_model(train_loader, val_loader, device='cpu', batch_size=10, epochs=10
     
     # Get a sample batch to determine input size
     for batch_X, _ in train_loader:
-        # Reshape the input to 2D for the model
-        # The model expects (batch_size, features) but we have (batch_size, channels, height, width)
-        batch_X = batch_X.view(batch_X.size(0), -1)  # Flatten all dimensions except batch
-        input_size = batch_X.size(1)
+        # Get input shape from first batch
+        input_shape = batch_X.shape
+        print(f"Input batch shape: {input_shape}")
+        
+        # Calculate flattened input size for the model
+        input_size = np.prod(input_shape[1:])
+        print(f"Flattened input size: {input_size}")
         break
         
-    # Initialize model
+    # Initialize model with correct input size
     model = UrticariaDetectionModel(input_size=input_size)
     model.to(device)
     
@@ -361,42 +382,57 @@ def save_training_plots(history):
 
 if __name__ == "__main__":
     # Path to your image data
-    image_source = os.path.join("train")
+    image_source = "train"  # Update this path to match your directory structure
+    
+    if not os.path.exists(image_source):
+        print(f"WARNING: Directory {image_source} not found. Creating empty directory.")
+        os.makedirs(image_source, exist_ok=True)
+        print(f"Please add image files to the {image_source} directory before running.")
+        exit(1)
     
     # Check if CUDA is available
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"Using device: {device}")
     
-    # Load and organize images
-    images, filenames = organize_images(image_source)
-    
-    # For demonstration - need actual labels in real application
-    # Here we're creating random labels (0 or 1) for demonstration
-    # In a real scenario, you'd load actual labels
-    labels = torch.randint(0, 2, (images.size(0),))
-    
-    # Prepare data loaders
-    train_loader, val_loader, test_loader = prepare_data(
-        images, labels, train_ratio=0.7, val_ratio=0.15, batch_size=10
-    )
-    
-    # Train the model
-    print("Starting model training...")
-    model, history = train_model(
-        train_loader, val_loader,
-        device=device,
-        batch_size=10,
-        epochs=100,
-        learning_rate=0.001
-    )
-    
-    # Save training plots
-    save_training_plots(history)
-    
-    # Test the model
-    print("\nEvaluating model on test data...")
-    test_results = test_model(model, test_loader, device=device)
-    
-    # Save the final model
-    torch.save(model.state_dict(), "final_urticaria_detection_model.pth")
-    print("\nModel training and evaluation complete!")
-    print("Final model saved as 'final_urticaria_detection_model.pth'")
+    try:
+        # Load and organize images with consistent size
+        print("Loading and organizing images...")
+        images, filenames = organize_images(image_source)
+        
+        print(f"Loaded {len(filenames)} images.")
+        print(f"Image tensor shape: {images.shape}")
+        
+        # For demonstration - need actual labels in real application
+        # Here we're creating random labels (0 or 1) for demonstration
+        # In a real scenario, you'd load actual labels from file or directory structure
+        labels = torch.randint(0, 2, (images.size(0),))
+        
+        # Prepare data loaders
+        train_loader, val_loader, test_loader = prepare_data(
+            images, labels, train_ratio=0.7, val_ratio=0.15, batch_size=10
+        )
+        
+        # Train the model
+        print("Starting model training...")
+        model, history = train_model(
+            train_loader, val_loader,
+            device=device,
+            batch_size=10,
+            epochs=100,
+            learning_rate=0.001
+        )
+        
+        # Save training plots
+        save_training_plots(history)
+        
+        # Test the model
+        print("\nEvaluating model on test data...")
+        test_results = test_model(model, test_loader, device=device)
+        
+        # Save the final model
+        torch.save(model.state_dict(), "final_urticaria_detection_model.pth")
+        print("\nModel training and evaluation complete!")
+        print("Final model saved as 'final_urticaria_detection_model.pth'")
+        
+    except Exception as e:
+        print(f"Error in execution: {e}")
